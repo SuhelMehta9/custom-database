@@ -30,7 +30,7 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement) {
 PrepareResult prepare_statement(InputBuffer *input_buffer,
                                 Statement *statement) {
   if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-    prepare_insert(input_buffer, statement);
+    return prepare_insert(input_buffer, statement);
   }
   if (strcmp(input_buffer->buffer, "select") == 0) {
     statement->type = STATEMENT_SELECT;

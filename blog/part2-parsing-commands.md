@@ -140,6 +140,8 @@ typedef enum {
 
 typedef enum {
   PREPARE_SUCCESS,
+  PREPARE_NEGATIVE_ID,
+  PREPARE_STRING_TOO_LONG,
   PREPARE_SYNTAX_ERROR,
   PREPARE_UNRECOGNIZED_STATEMENT
 } PrepareResult;
@@ -154,7 +156,7 @@ Notice that `StatementType` and `ExecuteResult` are written on a single line. Th
 | Enum | Values (Integer) | Purpose |
 |------|-------------------|---------|
 | `MetaCommandResult` | `META_COMMAND_SUCCESS` (0), `META_COMMAND_UNRECOGNIZED_COMMAND` (1) | Did the meta-command (e.g., `.exit`) work? |
-| `PrepareResult` | `PREPARE_SUCCESS` (0), `PREPARE_SYNTAX_ERROR` (1), `PREPARE_UNRECOGNIZED_STATEMENT` (2) | Was the SQL statement parsed correctly? |
+| `PrepareResult` | `PREPARE_SUCCESS` (0), `PREPARE_NEGATIVE_ID` (1), `PREPARE_STRING_TOO_LONG` (2), `PREPARE_SYNTAX_ERROR` (3), `PREPARE_UNRECOGNIZED_STATEMENT` (4) | Was the SQL statement parsed correctly? |
 | `StatementType` | `STATEMENT_INSERT` (0), `STATEMENT_SELECT` (1) | What kind of SQL statement is this? |
 | `ExecuteResult` | `EXECUTE_SUCCESS` (0), `EXECUTE_TABLE_FULL` (1) | Did the statement execute successfully? |
 
@@ -492,19 +494,42 @@ typedef struct {
 
 For a `SELECT` statement, we only need `type` — there's no data to store. The `row_to_insert` field is simply ignored.
 
-### Walking Through prepare_statement
+### Walking Through prepare_insert and prepare_statement
+
+To parse commands cleanly and validate user data, statement preparation is separated into two steps: `prepare_statement` determines the query type, and dedicated helper functions (like `prepare_insert`) parse arguments.
 
 ```c
-PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement) {
+PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement) {
+  statement->type = STATEMENT_INSERT;
+
+  char *keyword = strtok(input_buffer->buffer, " ");
+  char *id_string = strtok(NULL, " ");
+  char *username = strtok(NULL, " ");
+  char *email = strtok(NULL, " ");
+
+  if (id_string == NULL || username == NULL || email == NULL) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+
+  int id = atoi(id_string);
+  if (id < 0) {
+    return PREPARE_NEGATIVE_ID;
+  }
+  if (strlen(username) > COLUMN_USERNAME_SIZE) {
+    return PREPARE_STRING_TOO_LONG;
+  }
+
+  statement->row_to_insert.id = id;
+  strcpy(statement->row_to_insert.username, username);
+  strcpy(statement->row_to_insert.email, email);
+
+  return PREPARE_SUCCESS;
+}
+
+PrepareResult prepare_statement(InputBuffer *input_buffer,
+                                Statement *statement) {
   if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-    statement->type = STATEMENT_INSERT;
-    int args_assigned = sscanf(
-        input_buffer->buffer, "insert %d %s %s", &(statement->row_to_insert.id),
-        statement->row_to_insert.username, statement->row_to_insert.email);
-    if (args_assigned < 3) {
-      return PREPARE_SYNTAX_ERROR;
-    }
-    return PREPARE_SUCCESS;
+    return prepare_insert(input_buffer, statement);
   }
   if (strcmp(input_buffer->buffer, "select") == 0) {
     statement->type = STATEMENT_SELECT;
@@ -515,36 +540,50 @@ PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
 }
 ```
 
-Let's trace through this function with a few different inputs.
+> [!NOTE]
+> Notice the call to `strtok()`, `atoi()`, and `strlen()`. Rather than relying on a brittle single-pass `sscanf()`, tokenizing with `strtok` allows explicit validation before copying values into the target `Row`. Also ensure `prepare_statement()` returns the result of `prepare_insert()`.
+
+Let's trace through this with a few different inputs.
 
 **Example 1: Input is `"insert 1 alice alice@example.com"`**
 
-1. `strncmp(input_buffer->buffer, "insert", 6)` compares the first 6 characters: `"insert"` vs `"insert"`. They match! Returns `0`.
-2. `statement->type = STATEMENT_INSERT` — We set the statement type to INSERT.
-3. `sscanf` parses the full string. It matches `1` to `%d`, `alice` to the first `%s`, and `alice@example.com` to the second `%s`. Returns `3`.
-4. `args_assigned` is `3`, which is not less than `3`, so we skip the error check.
-5. Return `PREPARE_SUCCESS`. ✅
+1. `strncmp(input_buffer->buffer, "insert", 6)` matches `"insert"`.
+2. `prepare_insert()` is called. `strtok()` splits the string on spaces:
+   - `keyword` = `"insert"`
+   - `id_string` = `"1"`
+   - `username` = `"alice"`
+   - `email` = `"alice@example.com"`
+3. None of the tokens are `NULL`.
+4. `atoi("1")` converts `"1"` to integer `1` (positive, passes check).
+5. `strlen("alice")` is 5 (<= `COLUMN_USERNAME_SIZE`, passes check).
+6. Fields are copied into `statement->row_to_insert`.
+7. Returns `PREPARE_SUCCESS`. ✅
 
-**Example 2: Input is `"insert"`**
+**Example 2: Input is `"insert -5 alice alice@example.com"`**
 
-1. `strncmp` still matches (the first 6 characters of `"insert"` are `"insert"`). ✅
-2. `statement->type = STATEMENT_INSERT`.
-3. `sscanf` tries to parse but finds nothing after "insert". Returns `0` (no items matched).
-4. `args_assigned` is `0`, which IS less than `3`.
-5. Return `PREPARE_SYNTAX_ERROR`. ❌
+1. `strncmp` matches `"insert"`.
+2. In `prepare_insert()`, `atoi("-5")` yields `-5`.
+3. The check `if (id < 0)` catches the negative number.
+4. Returns `PREPARE_NEGATIVE_ID`. ❌
 
-**Example 3: Input is `"select"`**
+**Example 3: Input is `"insert"` (missing fields)**
 
-1. `strncmp(input_buffer->buffer, "insert", 6)` — the first 6 characters are `"select"` vs `"insert"`. They don't match. Skip this block.
-2. `strcmp(input_buffer->buffer, "select")` — exact match! Returns `0`.
+1. `strncmp` matches `"insert"`.
+2. First call to `strtok` gives `"insert"`, but subsequent calls return `NULL`.
+3. The check `id_string == NULL || username == NULL || email == NULL` triggers.
+4. Returns `PREPARE_SYNTAX_ERROR`. ❌
+
+**Example 4: Input is `"select"`**
+
+1. `strncmp(..., "insert", 6)` fails.
+2. `strcmp(input_buffer->buffer, "select")` matches exactly!
 3. `statement->type = STATEMENT_SELECT`.
-4. Return `PREPARE_SUCCESS`. ✅
+4. Returns `PREPARE_SUCCESS`. ✅
 
-**Example 4: Input is `"blah"`**
+**Example 5: Input is `"blah"`**
 
-1. `strncmp` for "insert"? No match. Skip.
-2. `strcmp` for "select"? No match. Skip.
-3. We fall through to the end: return `PREPARE_UNRECOGNIZED_STATEMENT`. ❌
+1. Fails both "insert" and "select".
+2. Falls through to the end: returns `PREPARE_UNRECOGNIZED_STATEMENT`. ❌
 
 **Why `strncmp` for insert but `strcmp` for select?**
 
@@ -553,56 +592,43 @@ Let's trace through this function with a few different inputs.
 
 ---
 
-## The & Operator in Action
+## Tokenizing vs Parsing with `sscanf`: Why We Evolved
 
-Look at the `sscanf` call one more time:
+Earlier, we looked at `sscanf()` as an easy way to parse inputs. But notice how in `prepare_insert` we transitioned to `strtok()` and manual validation.
 
+### Why `sscanf` with `%s` Is Risky
+When you run:
 ```c
-int args_assigned = sscanf(
-    input_buffer->buffer, "insert %d %s %s",
-    &(statement->row_to_insert.id),       // ← Has &
-    statement->row_to_insert.username,     // ← No &
-    statement->row_to_insert.email);       // ← No &
+// An earlier approach:
+sscanf(input_buffer->buffer, "insert %d %s %s", ...);
+```
+The `%s` format specifier has no default boundary guard. If someone submits an enormous username, `sscanf` continues writing past the bounds of your buffer.
+
+### How `strtok` + `strlen` Solves This
+By tokenizing:
+```c
+char *username = strtok(NULL, " ");
+if (strlen(username) > COLUMN_USERNAME_SIZE) {
+    return PREPARE_STRING_TOO_LONG;
+}
+```
+We inspect the token **before** copying it into `statement->row_to_insert.username` using `strcpy()`, protecting our database from corrupting adjacent memory.
+
+---
+
+## Memory Addresses, Arrays, and Pointers in Action
+
+Whether using `sscanf` or inspecting struct pointers in `prepare_insert`, you frequently encounter expressions like:
+```c
+statement->row_to_insert.id = id;
+strcpy(statement->row_to_insert.username, username);
 ```
 
-Why does `id` need `&` but `username` and `email` don't? This is one of the **most common sources of confusion** for C beginners, so let's take our time here.
+Notice:
+- `statement->row_to_insert.id` is a scalar `uint32_t`.
+- `statement->row_to_insert.username` is a `char[COLUMN_USERNAME_SIZE + 1]` array.
 
-### The Rule
-
-`sscanf` (and `scanf`) need to **write values** into your variables. To write into a variable, they need that variable's **memory address** — its location in RAM. The `&` operator gives you the address of a variable.
-
-But here's the key insight:
-
-- **`id`** is a `uint32_t` — a plain number. Its name refers to the **value itself** (like `42`). To get its address, you need `&`.
-- **`username`** is a `char[32]` — a character **array**. In C, the name of an array **already IS** a pointer to its first element. So `username` is already an address. Adding `&` would give you the address *of* the address — that's wrong!
-
-Think of it like this:
-
-| Variable | Type | What the name gives you | Need & for sscanf? |
-|---|---|---|---|
-| `id` | `uint32_t` | The value (e.g., `42`) | ✅ Yes — `&id` to get the address |
-| `username` | `char[32]` | Already an address (pointer to first char) | ❌ No — it's already an address |
-| `email` | `char[255]` | Already an address (pointer to first char) | ❌ No — it's already an address |
-
-### An Analogy
-
-Imagine you're a postal worker delivering a package (`sscanf` delivering a value):
-
-- **`id`** is like a person's name. You know *who* should get the package, but you need to look up their **address** (use `&`) to deliver it.
-- **`username`** is like a person who hands you their **business card with their address already on it**. You don't need to look anything up — you can deliver directly.
-
-In C, arrays "decay" to pointers in most contexts. This means when you use an array name in an expression, C automatically converts it to a pointer to the first element. This is why `username` (which is a `char[32]`) works where `sscanf` expects a `char *`.
-
-### The Parentheses in `&(statement->row_to_insert.id)`
-
-You might wonder about all those parentheses. Let's expand this expression:
-
-1. `statement` — pointer to a `Statement` struct
-2. `statement->row_to_insert` — access the `row_to_insert` field (the `->` operator dereferences the pointer AND accesses a member)
-3. `statement->row_to_insert.id` — access the `id` field of the row (using `.` because `row_to_insert` is a struct, not a pointer)
-4. `&(statement->row_to_insert.id)` — get the memory address of that `id` field
-
-The parentheses make it clear that `&` applies to the entire expression `statement->row_to_insert.id`, not just to `statement`. In practice, operator precedence would handle it correctly even without the parentheses (`.` and `->` bind more tightly than `&`), but the parentheses make it easier to read.
+In C, passing an array name (like `statement->row_to_insert.username`) to `strcpy()` automatically "decays" into a pointer to its first character (`char*`), so no `&` address-of operator is needed. But when referencing a scalar directly in functions that expect a pointer, you must use `&`.
 
 > [!TIP]
 > When in doubt about whether to use `&` with `scanf`/`sscanf`, ask yourself: "Is this variable already a pointer (or an array)?" If yes, no `&`. If it's a plain value type (`int`, `float`, `uint32_t`, `char`), use `&`.
@@ -634,6 +660,12 @@ int main(int argc, char *argv[]) {
     switch (prepare_statement(input_buffer, &statement)) {
     case (PREPARE_SUCCESS):
       break;
+    case (PREPARE_STRING_TOO_LONG):
+      printf("String is too long.\n");
+      continue;
+    case (PREPARE_NEGATIVE_ID):
+      printf("ID must be positive.\n");
+      continue;
     case (PREPARE_SYNTAX_ERROR):
       printf("Syntax error. Could not parse statement.\n");
       continue;
@@ -747,6 +779,10 @@ flowchart TD
     C -->|No| G["prepare_statement()"]
     G --> H{"Result?"}
     H -->|PREPARE_SUCCESS| I["execute_statement()"]
+    H -->|STRING_TOO_LONG| J1["Print: String is too long"]
+    J1 --> A
+    H -->|NEGATIVE_ID| J2["Print: ID must be positive"]
+    J2 --> A
     H -->|SYNTAX_ERROR| J["Print: Syntax error"]
     J --> A
     H -->|UNRECOGNIZED_STATEMENT| K["Print: Unrecognized keyword"]
@@ -767,30 +803,18 @@ Every path eventually loops back to the prompt — except `.exit`, which termina
 
 Our parser works, but there are a few rough edges worth discussing. Real-world code would address these, and we will too as our database matures.
 
-### 1. sscanf with %s Is Vulnerable to Buffer Overflow
+### 1. Returning Results from `prepare_statement` & Validating Lengths
 
-This is the biggest one. Look at our `sscanf` call:
-
+In our implementation of `prepare_statement()`, we check:
 ```c
-sscanf(input_buffer->buffer, "insert %d %s %s",
-    &(statement->row_to_insert.id),
-    statement->row_to_insert.username,
-    statement->row_to_insert.email);
+if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
+  return prepare_insert(input_buffer, statement); // Always return the enum result!
+}
 ```
+> [!WARNING]
+> Ensure you explicitly `return prepare_insert(...)`! Calling `prepare_insert(input_buffer, statement);` without a `return` statement in a non-void function leads to undefined behavior.
 
-The `%s` format specifier reads characters until it hits whitespace — but it has **no length limit**. If someone types a username that's 1,000 characters long, `sscanf` will happily write all 1,000 characters into `username`, which is only a `char[32]` array. That's a **buffer overflow** — writing past the end of allocated memory.
-
-**The fix:** Specify maximum field widths in the format string:
-
-```c
-sscanf(input_buffer->buffer, "insert %d %31s %254s",
-    &(statement->row_to_insert.id),
-    statement->row_to_insert.username,
-    statement->row_to_insert.email);
-```
-
-- **`%31s`** reads at most 31 characters for username (leaving 1 byte for the null terminator `\0` in a `char[32]` array).
-- **`%254s`** reads at most 254 characters for email (leaving 1 byte for `\0` in a `char[255]` array).
+Also, notice how `prepare_insert` checks `strlen(username) > COLUMN_USERNAME_SIZE`. We should also validate `strlen(email) > COLUMN_EMAIL_SIZE` to keep email strings just as safely guarded.
 
 > [!CAUTION]
 > Buffer overflows are one of the most dangerous bugs in C. They can crash your program, corrupt data, or — in the worst case — allow attackers to execute arbitrary code. Always validate input lengths.

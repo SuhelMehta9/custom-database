@@ -111,8 +111,8 @@ In a real database like SQLite or PostgreSQL, you'd run `CREATE TABLE` to define
 
 typedef struct {
   uint32_t id;
-  char username[COLUMN_USERNAME_SIZE];
-  char email[COLUMN_EMAIL_SIZE];
+  char username[COLUMN_USERNAME_SIZE + 1];
+  char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 ```
 
@@ -149,32 +149,32 @@ Now let's look at the three fields:
 
 We just covered `uint32_t`. This field stores the row's unique identifier. It takes exactly 4 bytes.
 
-#### `char username[COLUMN_USERNAME_SIZE]` — 32 bytes
+#### `char username[COLUMN_USERNAME_SIZE + 1]` — 33 bytes
 
-This is a **fixed-size character array**. It always occupies exactly 32 bytes in memory, regardless of how long the actual username is. If the username is `"alice"` (5 characters + 1 null terminator = 6 bytes), the remaining 26 bytes are just sitting there, unused.
+This is a **fixed-size character array**. We allocate `COLUMN_USERNAME_SIZE + 1` (33 bytes) so a username can store up to 32 visible characters plus a null terminator (`\0`). It always occupies exactly 33 bytes in memory, regardless of how long the actual username is. If the username is `"alice"` (5 characters + 1 null terminator = 6 bytes), the remaining 27 bytes are just sitting there, unused.
 
 This might seem wasteful, but it's a deliberate design choice. Here's why:
 
 > [!IMPORTANT]
 > **Why fixed-size arrays instead of pointers?**
 >
-> In a database, we need to know *exactly* how many bytes each row takes. If every row is exactly 291 bytes, we can calculate where row #500 lives with simple math. If rows were variable-sized, we'd need a much more complex system to find any given row.
+> In a database, we need to know *exactly* how many bytes each row takes. If every row is exactly 293 bytes, we can calculate where row #500 lives with simple math. If rows were variable-sized, we'd need a much more complex system to find any given row.
 
 Let's compare the two approaches:
 
-| Feature | `char username[32]` (Fixed Array) | `char *username` (Pointer) |
+| Feature | `char username[33]` (Fixed Array) | `char *username` (Pointer) |
 |---------|----------------------------------|---------------------------|
-| Size in struct | Always 32 bytes | 8 bytes (just the pointer) |
+| Size in struct | Always 33 bytes | 8 bytes (just the pointer) |
 | Actual data | Stored **inside** the struct | Stored **somewhere else** in memory |
 | Total row size | Predictable, constant | Variable, depends on string length |
 | Serialization | Simple — just copy the bytes | Complex — must follow the pointer |
 | Memory efficiency | Wastes space for short strings | More efficient for variable lengths |
 
-Think of it this way: `char username[32]` is like a box with a fixed size — the name is written *inside* the box. `char *username` is like a slip of paper with an address on it — the actual name is stored at that address, somewhere else. When we need to pack rows tightly into pages, having everything *inside the box* makes life much simpler.
+Think of it this way: `char username[33]` is like a box with a fixed size — the name is written *inside* the box. `char *username` is like a slip of paper with an address on it — the actual name is stored at that address, somewhere else. When we need to pack rows tightly into pages, having everything *inside the box* makes life much simpler.
 
-#### `char email[COLUMN_EMAIL_SIZE]` — 255 bytes
+#### `char email[COLUMN_EMAIL_SIZE + 1]` — 256 bytes
 
-Same idea as username, but bigger. The 255-byte limit comes from a common convention — many systems cap email addresses at 254 characters (plus 1 for the null terminator that marks the end of a C string).
+Same idea as username, but bigger. The `+ 1` guarantees room for 255 visible characters plus the trailing null terminator (`\0`).
 
 ### Total Row Size
 
@@ -183,11 +183,11 @@ Let's add it up:
 | Field | Type | Size (bytes) |
 |-------|------|:------------:|
 | `id` | `uint32_t` | 4 |
-| `username` | `char[32]` | 32 |
-| `email` | `char[255]` | 255 |
-| **Total** | | **291** |
+| `username` | `char[33]` | 33 |
+| `email` | `char[256]` | 256 |
+| **Total** | | **293** |
 
-Every single row in our database is exactly **291 bytes**. No exceptions.
+Every single row in our database is exactly **293 bytes**. No exceptions.
 
 ### Row Memory Layout
 
@@ -195,10 +195,10 @@ Here's how a single `Row` looks in memory:
 
 ```mermaid
 graph LR
-    subgraph Row["Row — 291 bytes total"]
+    subgraph Row["Row — 293 bytes total"]
         A["id<br/>4 bytes<br/>offset 0"]
-        B["username<br/>32 bytes<br/>offset 4"]
-        C["email<br/>255 bytes<br/>offset 36"]
+        B["username<br/>33 bytes<br/>offset 4"]
+        C["email<br/>256 bytes<br/>offset 37"]
     end
     A --- B --- C
 
@@ -248,16 +248,16 @@ So `sizeof(((Struct *)0)->Attribute)` means: *"Tell me how many bytes the `Attri
 
 ```c
 const uint32_t ID_SIZE = size_of_attribute(Row, id);           // → 4
-const uint32_t USERNAME_SIZE = size_of_attribute(Row, username); // → 32
-const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);       // → 255
+const uint32_t USERNAME_SIZE = size_of_attribute(Row, username); // → 33
+const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);       // → 256
 ```
 
 After macro expansion, the compiler sees:
 
 ```c
 const uint32_t ID_SIZE = sizeof(((Row *)0)->id);           // → sizeof(uint32_t)   → 4
-const uint32_t USERNAME_SIZE = sizeof(((Row *)0)->username); // → sizeof(char[32])   → 32
-const uint32_t EMAIL_SIZE = sizeof(((Row *)0)->email);       // → sizeof(char[255])  → 255
+const uint32_t USERNAME_SIZE = sizeof(((Row *)0)->username); // → sizeof(char[33])   → 33
+const uint32_t EMAIL_SIZE = sizeof(((Row *)0)->email);       // → sizeof(char[256])  → 256
 ```
 
 ### Why Not Just Write the Numbers?
@@ -266,8 +266,8 @@ You *could* write:
 
 ```c
 const uint32_t ID_SIZE = 4;
-const uint32_t USERNAME_SIZE = 32;
-const uint32_t EMAIL_SIZE = 255;
+const uint32_t USERNAME_SIZE = 33;
+const uint32_t EMAIL_SIZE = 256;
 ```
 
 But what if you later change `id` from `uint32_t` to `uint64_t`? You'd need to remember to update `ID_SIZE` from `4` to `8`. With the macro, it updates automatically. This is the **DRY principle** — Don't Repeat Yourself.
@@ -309,8 +309,8 @@ Now we need to know where each field starts within a row's raw byte representati
 ```c
 const uint32_t ID_OFFSET = 0;
 const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;       // 0 + 4  = 4
-const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE; // 4 + 32 = 36
-const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE; // 4 + 32 + 255 = 291
+const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE; // 4 + 33 = 37
+const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE; // 4 + 33 + 256 = 293
 ```
 
 ### Why Do Offsets Matter?
@@ -318,37 +318,37 @@ const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE; // 4 + 32 + 255 
 When we serialize a `Row` struct into raw bytes (we'll see this next), we need to know exactly where to put each piece of data. Think of it like packing a suitcase with labeled compartments:
 
 - Bytes 0–3: The ID goes here
-- Bytes 4–35: The username goes here
-- Bytes 36–290: The email goes here
+- Bytes 4–36: The username goes here
+- Bytes 37–292: The email goes here
 
 ### Visual Memory Layout
 
-Imagine a single row as a strip of 291 bytes:
+Imagine a single row as a strip of 293 bytes:
 
 ```mermaid
 graph LR
-    subgraph ByteStrip["Flat Byte Array — 291 bytes"]
+    subgraph ByteStrip["Flat Byte Array — 293 bytes"]
         direction LR
         B0["Byte 0"]
         B3["Byte 3"]
         B4["Byte 4"]
-        B35["Byte 35"]
         B36["Byte 36"]
-        B290["Byte 290"]
+        B37["Byte 37"]
+        B292["Byte 292"]
     end
 
     subgraph Fields["Field Mapping"]
         ID["id (uint32_t)<br/>ID_OFFSET = 0<br/>ID_SIZE = 4"]
-        UN["username (char × 32)<br/>USERNAME_OFFSET = 4<br/>USERNAME_SIZE = 32"]
-        EM["email (char × 255)<br/>EMAIL_OFFSET = 36<br/>EMAIL_SIZE = 255"]
+        UN["username (char × 33)<br/>USERNAME_OFFSET = 4<br/>USERNAME_SIZE = 33"]
+        EM["email (char × 256)<br/>EMAIL_OFFSET = 37<br/>EMAIL_SIZE = 256"]
     end
 
     ID --> B0
     ID --> B3
     UN --> B4
-    UN --> B35
-    EM --> B36
-    EM --> B290
+    UN --> B36
+    EM --> B37
+    EM --> B292
 
     style ID fill:#4a9eff,color:#fff
     style UN fill:#34d399,color:#fff
@@ -358,7 +358,7 @@ graph LR
 Here's a more concrete picture. Suppose we store the row `(1, "alice", "alice@example.com")`:
 
 ```
-Byte:  0  1  2  3  | 4  5  6  7  8  9 ... 35 | 36 37 38 39 ...           290
+Byte:  0  1  2  3  | 4  5  6  7  8  9 ... 36 | 37 38 39 40 ...           292
        ─────────── | ──────────────────────── | ─────────────────────────────
 Data:  01 00 00 00 | a  l  i  c  e  \0 ... \0 | a  l  i  c  e  @  e  ... \0
        └─ id = 1 ─┘ └──── username ─────────┘  └──────── email ───────────┘
@@ -371,11 +371,11 @@ Data:  01 00 00 00 | a  l  i  c  e  \0 ... \0 | a  l  i  c  e  @  e  ... \0
 
 ```c
 const uint32_t PAGE_SIZE = 4096;
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;     // 4096 / 291 = 14
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES; // 14 * 100 = 1400
+const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;     // 4096 / 293 = 13
+const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES; // 13 * 100 = 1300
 ```
 
-We'll discuss pages shortly, but note that **integer division truncates** in C. `4096 / 291` is `14.07...`, but since both operands are integers, C drops the decimal part and gives us `14`. That means each page holds exactly 14 rows, with `4096 - (14 × 291) = 4096 - 4074 = 22` bytes of unused space at the end of each page. A small price to pay for simplicity.
+We'll discuss pages shortly, but note that **integer division truncates** in C. `4096 / 293` is `13.97...`, but since both operands are integers, C drops the decimal part and gives us `13`. That means each page holds exactly 13 rows, with `4096 - (13 × 293) = 4096 - 3809 = 287` bytes of unused space at the end of each page. A small price to pay for simplicity.
 
 ---
 
@@ -558,22 +558,22 @@ Why 4,096? Because that's the size of a **memory page** in most operating system
 
 ### How Many Rows Fit in a Page?
 
-Each row is 291 bytes, and each page is 4,096 bytes:
+Each row is 293 bytes, and each page is 4,096 bytes:
 
 ```c
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;  // 4096 / 291 = 14
+const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;  // 4096 / 293 = 13
 ```
 
-So **14 rows** fit in each page, with 22 bytes left over at the end (wasted, but that's OK).
+So **13 rows** fit in each page, with 287 bytes left over at the end (wasted, but that's OK).
 
 ### How Many Pages Can We Have?
 
 ```c
 #define TABLE_MAX_PAGES 100
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;  // 14 × 100 = 1,400
+const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;  // 13 × 100 = 1,300
 ```
 
-Our table supports up to **100 pages**, which means a maximum of **1,400 rows**. That's not much for a real database, but it's plenty for learning!
+Our table supports up to **100 pages**, which means a maximum of **1,300 rows**. That's not much for a real database, but it's plenty for learning!
 
 ### The `Table` Struct
 
@@ -634,7 +634,7 @@ graph TD
     style NULLD fill:#f87171,color:#fff
 ```
 
-In this example, we've inserted 3 rows. All 3 fit on page 0 (which can hold 14 rows), so only page 0 has been allocated. Pages 1 through 99 are still NULL — we won't allocate memory for them until we actually need them. This strategy is called **lazy allocation**, and it's a great way to avoid wasting memory.
+In this example, we've inserted 3 rows. All 3 fit on page 0 (which can hold 13 rows), so only page 0 has been allocated. Pages 1 through 99 are still NULL — we won't allocate memory for them until we actually need them. This strategy is called **lazy allocation**, and it's a great way to avoid wasting memory.
 
 ---
 
@@ -664,7 +664,7 @@ This function is the bridge between "I want row #15" and "here's the exact memor
 uint32_t page_num = row_num / ROWS_PER_PAGE;
 ```
 
-Since each page holds 14 rows, we use **integer division** to figure out which page a row belongs to:
+Since each page holds 13 rows, we use **integer division** to figure out which page a row belongs to:
 
 - Rows 0–13 → `0 / 14 = 0`, `13 / 14 = 0` → page 0
 - Rows 14–27 → `14 / 14 = 1`, `27 / 14 = 1` → page 1
@@ -719,22 +719,22 @@ Let's trace through `row_slot(table, 15)`:
 
 | Step | Calculation | Result |
 |------|-------------|--------|
-| Which page? | `15 / 14` | **1** (page 1) |
+| Which page? | `15 / 13` | **1** (page 1) |
 | Page allocated? | `table->pages[1]` | If NULL → `malloc(4096)` |
-| Row within page? | `15 % 14` | **1** (second row) |
-| Byte offset? | `1 × 291` | **291** |
-| Final address | `page + 291` | Pointer to byte 291 of page 1 |
+| Row within page? | `15 % 13` | **2** (third row) |
+| Byte offset? | `2 × 293` | **586** |
+| Final address | `page + 586` | Pointer to byte 586 of page 1 |
 
-So row #15 lives at **byte 291 of page 1** — right after row #14 (which occupies bytes 0–290 of page 1).
+So row #15 lives at **byte 586 of page 1** — occupying bytes 586–878 of page 1.
 
 ```mermaid
 graph TD
     subgraph Page1["Page 1 — 4096 bytes"]
-        R14["Row 14<br/>bytes 0–290"]
-        R15["Row 15 ← HERE<br/>bytes 291–581"]
-        R16["Row 16<br/>bytes 582–872"]
-        REST["...<br/>Rows 17–27"]
-        EMPTY["Unused<br/>bytes 4074–4095"]
+        R13["Row 13<br/>bytes 0–292"]
+        R14["Row 14<br/>bytes 293–585"]
+        R15["Row 15 ← HERE<br/>bytes 586–878"]
+        REST["...<br/>Rows 16–25"]
+        EMPTY["Unused<br/>bytes 3809–4095"]
     end
 
     style R15 fill:#4a9eff,color:#fff
@@ -774,7 +774,7 @@ if (table->num_rows >= TABLE_MAX_ROWS) {
 }
 ```
 
-Before inserting, we check if we've hit the 1,400-row limit. If so, we return `EXECUTE_TABLE_FULL` — the caller can then print an error message. This is a simple safety check that prevents writing past our allocated memory.
+Before inserting, we check if we've hit the 1,300-row limit. If so, we return `EXECUTE_TABLE_FULL` — the caller can then print an error message. This is a simple safety check that prevents writing past our allocated memory.
 
 #### Line 2: Get a pointer to the row data
 
