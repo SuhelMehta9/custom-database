@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+=======
+# Xmake cache
+.xmake/
+build/
+
+# MacOS Cache
+.DS_Store
+
+
